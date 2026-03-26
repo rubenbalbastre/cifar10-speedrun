@@ -17,6 +17,19 @@ import torchvision.transforms as T
 
 torch.backends.cudnn.benchmark = True
 
+
+class Hyperparameters:
+    # Selective TTA gating:
+    # - "quantile": select lowest-confidence fraction
+    # - "entropy": select samples with entropy above threshold
+    TTA_SELECTION_METHOD = "quantile"  # "quantile" | "entropy"
+    UNCERTAIN_QUANTILE = 0.25
+    ENTROPY_THRESHOLD = 1.0
+    ENTROPY_TEMPERATURE = 1.0
+
+
+HP = Hyperparameters()
+
 #############################################
 #               Muon optimizer              #
 #############################################
@@ -501,7 +514,15 @@ def print_training_details(variables, is_final_entry):
 #               Evaluation                 #
 ############################################
 
-def infer(model, loader, tta_level=0):
+def infer(
+    model,
+    loader,
+    tta_level=0,
+    tta_selection_method="quantile",
+    uncertain_quantile=0.25,
+    entropy_threshold=1.0,
+    entropy_temperature=1.0,
+):
     def infer_basic(inputs, net):
         return net(inputs).clone()
 
@@ -527,10 +548,8 @@ def infer(model, loader, tta_level=0):
     def tta(model, test_images) -> torch.Tensor:
         with torch.no_grad():
             model.eval()
-            device = test_images.device
             B = 2000
             pad = 1
-            n = test_images.shape[0]
             all_logits_list = []
             for inputs_batch in test_images.split(B):
                 inputs_batch = inputs_batch.contiguous(
@@ -538,13 +557,27 @@ def infer(model, loader, tta_level=0):
                 )
                 all_logits_list.append(model(inputs_batch).clone())
             initial_logits = torch.cat(all_logits_list, dim=0)
-            probs = F.softmax(initial_logits, dim=1)
-            confidences, _ = probs.max(dim=1)
-            UNCERTAIN_QUANTILE = 0.25
-            k_uncertain = int(n * UNCERTAIN_QUANTILE)
-            _, uncertain_indices = torch.topk(
-                confidences, k_uncertain, largest=False, sorted=False
-            )
+            n = initial_logits.shape[0]
+
+            if tta_selection_method == "entropy":
+                scaled_logits = initial_logits / entropy_temperature
+                probs = F.softmax(scaled_logits, dim=1)
+                entropies = -(probs * probs.clamp_min(1e-12).log()).sum(dim=1)
+                uncertain_indices = torch.where(entropies > entropy_threshold)[0]
+            else:
+                probs = F.softmax(initial_logits, dim=1)
+                confidences, _ = probs.max(dim=1)
+                k_uncertain = int(n * uncertain_quantile)
+                if k_uncertain > 0:
+                    _, uncertain_indices = torch.topk(
+                        confidences, k_uncertain, largest=False, sorted=False
+                    )
+                else:
+                    uncertain_indices = torch.empty(
+                        0, device=initial_logits.device, dtype=torch.long
+                    )
+
+            k_uncertain = uncertain_indices.numel()
 
             tta_logits_parts = []
             tta_batch_size = 2000
@@ -585,7 +618,14 @@ def evaluate(model, loader, tta_level=0):
 #                Training                  #
 ############################################
 
-def main(run, model):
+def main(
+    run,
+    model,
+    tta_selection_method="quantile",
+    uncertain_quantile=0.25,
+    entropy_threshold=1.0,
+    entropy_temperature=1.0,
+):
     training_batch_size = 1536
     bias_lr = 0.0573
     head_lr = 0.5415
@@ -719,7 +759,22 @@ def main(run, model):
     #  TTA Evaluation  #
     ####################
 
-    tta_val_acc = evaluate(model, test_loader, tta_level=2)
+    tta_val_acc = (
+        infer(
+            model,
+            test_loader,
+            tta_level=2,
+            tta_selection_method=tta_selection_method,
+            uncertain_quantile=uncertain_quantile,
+            entropy_threshold=entropy_threshold,
+            entropy_temperature=entropy_temperature,
+        )
+        .argmax(1)
+        .eq(test_loader.labels)
+        .float()
+        .mean()
+        .item()
+    )
     stop_timer()
     epoch = "eval"
     train_acc = evaluate(model, train_loader, tta_level=0)
@@ -731,13 +786,27 @@ if __name__ == "__main__":
     model = CifarNet().cuda().to(memory_format=torch.channels_last)
     model.compile(mode="max-autotune")
     print_columns(logging_columns_list, is_head=True)
-    main("warmup", model)
+    main(
+        "warmup",
+        model,
+        tta_selection_method=HP.TTA_SELECTION_METHOD,
+        uncertain_quantile=HP.UNCERTAIN_QUANTILE,
+        entropy_threshold=HP.ENTROPY_THRESHOLD,
+        entropy_temperature=HP.ENTROPY_TEMPERATURE,
+    )
     results = []
     for run in range(200):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         torch.cuda._sleep(int(6000000000))
-        val_acc, tta_val_acc, time_seconds = main(run + 1, model)
+        val_acc, tta_val_acc, time_seconds = main(
+            run + 1,
+            model,
+            tta_selection_method=HP.TTA_SELECTION_METHOD,
+            uncertain_quantile=HP.UNCERTAIN_QUANTILE,
+            entropy_threshold=HP.ENTROPY_THRESHOLD,
+            entropy_temperature=HP.ENTROPY_TEMPERATURE,
+        )
         results.append((val_acc, tta_val_acc, time_seconds))
         accs_so_far = [a for _, a, _ in results]
         times_so_far = [t for _, _, t in results]
