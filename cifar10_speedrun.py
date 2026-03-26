@@ -502,6 +502,8 @@ logging_columns_list = [
     "val_acc",
     "tta_val_acc",
     "tta_gain",
+    "tta_selected_frac",
+    "tta_time_seconds",
     "time_seconds",
 ]
 def print_training_details(variables, is_final_entry):
@@ -530,6 +532,7 @@ def infer(
     uncertain_quantile=0.25,
     entropy_threshold=1.0,
     entropy_temperature=1.0,
+    return_stats=False,
 ):
     def infer_basic(inputs, net):
         return net(inputs).clone()
@@ -553,7 +556,7 @@ def infer(
         return averaged_logits
 
     @torch.compile()
-    def tta(model, test_images) -> torch.Tensor:
+    def tta(model, test_images):
         with torch.no_grad():
             model.eval()
             B = 2000
@@ -604,8 +607,8 @@ def infer(
                 all_tta_logits_for_uncertain = torch.cat(tta_logits_parts, dim=0)
                 final_logits = initial_logits.clone()
                 final_logits[uncertain_indices] = all_tta_logits_for_uncertain
-                return final_logits
-            return initial_logits
+                return final_logits, uncertain_indices
+            return initial_logits, uncertain_indices
 
     test_images = loader.normalize(loader.images)
     if tta_level < 2:
@@ -616,7 +619,17 @@ def infer(
                 [infer_fn(inputs, model) for inputs in test_images.split(2000)]
             )
     else:  # tta_level == 2
-        return tta(model, test_images)
+        tta_starter = torch.cuda.Event(enable_timing=True)
+        tta_ender = torch.cuda.Event(enable_timing=True)
+        tta_starter.record()
+        logits, uncertain_indices = tta(model, test_images)
+        tta_ender.record()
+        torch.cuda.synchronize()
+        tta_time_seconds = 1e-3 * tta_starter.elapsed_time(tta_ender)
+        tta_selected_frac = uncertain_indices.numel() / max(1, test_images.shape[0])
+        if return_stats:
+            return logits, tta_selected_frac, tta_time_seconds
+        return logits
 
 def evaluate(model, loader, tta_level=0):
     logits = infer(model, loader, tta_level)
@@ -767,22 +780,17 @@ def main(
     #  TTA Evaluation  #
     ####################
 
-    tta_val_acc = (
-        infer(
-            model,
-            test_loader,
-            tta_level=2,
-            tta_selection_method=tta_selection_method,
-            uncertain_quantile=uncertain_quantile,
-            entropy_threshold=entropy_threshold,
-            entropy_temperature=entropy_temperature,
-        )
-        .argmax(1)
-        .eq(test_loader.labels)
-        .float()
-        .mean()
-        .item()
+    tta_logits, tta_selected_frac, tta_time_seconds = infer(
+        model,
+        test_loader,
+        tta_level=2,
+        tta_selection_method=tta_selection_method,
+        uncertain_quantile=uncertain_quantile,
+        entropy_threshold=entropy_threshold,
+        entropy_temperature=entropy_temperature,
+        return_stats=True,
     )
+    tta_val_acc = tta_logits.argmax(1).eq(test_loader.labels).float().mean().item()
     stop_timer()
     epoch = "eval"
     train_acc = evaluate(model, train_loader, tta_level=0)
