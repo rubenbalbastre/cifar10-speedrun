@@ -24,7 +24,6 @@ class Hyperparameters:
     # - "entropy": select samples with entropy above threshold
     TTA_SELECTION_METHOD = "quantile"  # "quantile" | "entropy"
     UNCERTAIN_QUANTILE = 0.25
-    ENTROPY_THRESHOLD = 1.0
     ENTROPY_TEMPERATURE = 1.0
 
 
@@ -530,7 +529,6 @@ def infer(
     tta_level=0,
     tta_selection_method="quantile",
     uncertain_quantile=0.25,
-    entropy_threshold=1.0,
     entropy_temperature=1.0,
     return_stats=False,
 ):
@@ -574,7 +572,17 @@ def infer(
                 scaled_logits = initial_logits / entropy_temperature
                 probs = F.softmax(scaled_logits, dim=1)
                 entropies = -(probs * probs.clamp_min(1e-12).log()).sum(dim=1)
-                uncertain_indices = torch.where(entropies > entropy_threshold)[0]
+                # Keep selection size static for compile/runtime stability.
+                # Dynamic thresholded indexing can trigger graph breaks/recompiles.
+                k_uncertain = int(n * uncertain_quantile)
+                if k_uncertain > 0:
+                    _, uncertain_indices = torch.topk(
+                        entropies, k_uncertain, largest=True, sorted=False
+                    )
+                else:
+                    uncertain_indices = torch.empty(
+                        0, device=initial_logits.device, dtype=torch.long
+                    )
             else:
                 probs = F.softmax(initial_logits, dim=1)
                 confidences, _ = probs.max(dim=1)
@@ -644,7 +652,6 @@ def main(
     model,
     tta_selection_method="quantile",
     uncertain_quantile=0.25,
-    entropy_threshold=1.0,
     entropy_temperature=1.0,
 ):
     training_batch_size = 1536
@@ -786,7 +793,6 @@ def main(
         tta_level=2,
         tta_selection_method=tta_selection_method,
         uncertain_quantile=uncertain_quantile,
-        entropy_threshold=entropy_threshold,
         entropy_temperature=entropy_temperature,
         return_stats=True,
     )
@@ -808,7 +814,6 @@ if __name__ == "__main__":
         model,
         tta_selection_method=HP.TTA_SELECTION_METHOD,
         uncertain_quantile=HP.UNCERTAIN_QUANTILE,
-        entropy_threshold=HP.ENTROPY_THRESHOLD,
         entropy_temperature=HP.ENTROPY_TEMPERATURE,
     )
     results = []
@@ -821,7 +826,6 @@ if __name__ == "__main__":
             model,
             tta_selection_method=HP.TTA_SELECTION_METHOD,
             uncertain_quantile=HP.UNCERTAIN_QUANTILE,
-            entropy_threshold=HP.ENTROPY_THRESHOLD,
             entropy_temperature=HP.ENTROPY_TEMPERATURE,
         )
         results.append((val_acc, tta_val_acc, time_seconds))
